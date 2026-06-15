@@ -240,10 +240,17 @@ def _run_reconstruction_pipeline(recon_obj, resolved_kwargs, class_type):
         recon_obj.preprocess(**preprocess_kwargs)
 
     # Reconstruct step
-    reconstruct_kwargs = resolved_kwargs.get("reconstruct", {})
-    reconstruct_kwargs["verbose"] = False
-    if reconstruct_kwargs:
-        recon_obj.reconstruct(**reconstruct_kwargs)
+    try:  # 20260505 edit; for direct_ptycho.optimize_hyperparameters
+        reconstruct_kwargs = resolved_kwargs.get("reconstruct", {})
+        # reconstruct_kwargs["verbose"] = False #20260505
+        if reconstruct_kwargs:
+            recon_obj.reconstruct(**reconstruct_kwargs)
+    except Exception:  # for OptimizePtychography.from_constructors.optimize()
+        reconstruct_kwargs = resolved_kwargs.get("reconstruct", {})
+        # reconstruct_kwargs["verbose"] = False #20260505
+        if reconstruct_kwargs:
+            recon_obj.reconstruct(**reconstruct_kwargs)
+    # end of 20260505
 
 
 def _extract_default_loss(recon_obj, class_type):
