@@ -117,6 +117,41 @@ class PtychoObjConstraintParams:
             Soft penalty pulling the first and last slices toward zero. Useful
             for thick samples embedded in vacuum. Multislice only and requires
             ``num_slices >= 3``.
+        kz_filter_beta : float | None, default ``None``
+            Multislice (``num_slices > 1``) only. Strength of a 3-D Fourier
+            depth regularizer that damps high-kz / low-kr Fourier components,
+            stabilizing layer separation. This is the same regularizer as
+            ``par.regularize_layers`` in fold_slice / PtychoShelves
+            (``regulation_multilayers.m``) and ``kz_filter`` in ptyrad;
+            typical values are ``0.1``-``1``. ``None`` disables it.
+
+            WARNING: overlaps with ``z_blur_sigma`` — both are depth
+            regularizers, and enabling both double-smooths the depth axis.
+            Prefer ``kz_filter_beta`` for general multislice specimens; prefer
+            ``z_blur_sigma`` for twisted 2-D materials / vertical
+            heterostructures, where this filter's Fourier wrap-around at the
+            top/bottom slice is undesirable.
+        kz_filter_alpha : float, default ``1.0``
+            Lateral Gaussian damping exponent used by ``kz_filter_beta``
+            (``0`` disables the lateral roll-off). fold_slice fixes this at
+            ``1.0``; exposed here for tuning as in ptyrad.
+        kr_filter_radius : float | None, default ``None``
+            Lateral Fourier band-limit cutoff, as a fraction of Nyquist
+            (``(0, 1]``). Applies a smoother sigmoid roll-off than the
+            Butterworth ``q_lowpass``. ``None`` disables it.
+
+            WARNING: overlaps with ``q_lowpass``/``butterworth_order`` — both
+            are lateral low-pass filters. If both are active their transfer
+            functions multiply, over-suppressing high frequencies. Use one or
+            the other.
+        kr_filter_width : float, default ``0.05``
+            Sigmoid transition width for ``kr_filter_radius`` (smaller = a
+            harder edge).
+        z_blur_sigma : float | None, default ``None``
+            Multislice (``num_slices > 1``) only. Standard deviation, in
+            z-pixels, of a real-space 1-D Gaussian blur applied along the
+            slice axis. Ptyrad's ``obj_zblur``. ``None`` disables it. See the
+            ``kz_filter_beta`` warning above for how the two relate.
         """
 
         # hard constraints
@@ -131,6 +166,11 @@ class PtychoObjConstraintParams:
         butterworth_order: int = 4
         q_lowpass: float | None = None  # A^-1
         q_highpass: float | None = None  # A^-1
+        kz_filter_beta: float | None = None  # None disables; fold_slice's par.regularize_layers
+        kz_filter_alpha: float = 1.0  # lateral Gaussian damping exponent for kz_filter_beta
+        kr_filter_radius: float | None = None  # fraction of Nyquist, (0, 1]
+        kr_filter_width: float = 0.05  # sigmoid transition width
+        z_blur_sigma: float | None = None  # z-pixels
         # soft constraints
         tv_weight_z: float = 0.0
         tv_weight_xy: float = 0.0
@@ -149,6 +189,11 @@ class PtychoObjConstraintParams:
             "butterworth_order",
             "q_lowpass",
             "q_highpass",
+            "kz_filter_beta",
+            "kz_filter_alpha",
+            "kr_filter_radius",
+            "kr_filter_width",
+            "z_blur_sigma",
         ]
 
     @dataclass
@@ -567,6 +612,15 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
         if any([c.q_lowpass, c.q_highpass]):
             obj = self.butterworth_constraint(obj, sampling=self.sampling)
 
+        if self.num_slices > 1 and c.kz_filter_beta is not None:
+            obj = self.kz_filter(obj, beta=c.kz_filter_beta, alpha=c.kz_filter_alpha)
+
+        if c.kr_filter_radius is not None:
+            obj = self.kr_filter(obj, radius=c.kr_filter_radius, width=c.kr_filter_width)
+
+        if self.num_slices > 1 and c.z_blur_sigma is not None:
+            obj = self.gaussian_blur_z(obj, sigma=c.z_blur_sigma)
+
         if self.num_slices > 1 and c.identical_slices:
             # In-place mutation is safe because apply_hard_constraints is
             # always called under outer torch.no_grad (see its docstring).
@@ -809,6 +863,130 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
             tensor = tensor.real
 
         return tensor
+
+    def kz_filter(self, tensor: torch.Tensor, beta: float, alpha: float = 1.0) -> torch.Tensor:
+        """3-D Fourier depth regularizer (fold_slice/PtychoShelves ``regularize_layers``).
+
+        Damps high-kz / low-kr Fourier components to stabilize layer
+        separation in multislice reconstructions. Mathematically identical to
+        fold_slice's ``regulation_multilayers.m`` (``beta = par.regularize_layers``,
+        ``alpha`` fixed at ``1``) and ptyrad's ``kz_filter``.
+
+        Transfer function::
+
+            W(k)  = 1 - (2/pi) * arctan((beta * |kz| / sqrt(kx^2 + ky^2))^2)
+            Wa(k) = W(k) * exp(-alpha * (kx^2 + ky^2))
+
+        Parameters
+        ----------
+        tensor : torch.Tensor
+            Real or complex, shape ``(slices, H, W)`` with ``slices > 1``.
+            Complex inputs are filtered as independent real/imag channels
+            (matching ``gaussian_blur_2d``/``butterworth_constraint``).
+        beta : float
+            Depth-suppression strength; larger values attenuate high-kz
+            content more aggressively. Typical range ``0.1``-``1``.
+        alpha : float
+            Lateral Gaussian damping exponent; ``0`` disables the lateral
+            roll-off.
+        """
+        Nz, Ny, Nx = tensor.shape[-3:]
+        kz = torch.fft.fftfreq(Nz, device=tensor.device)
+        ky = torch.fft.fftfreq(Ny, device=tensor.device)
+        kx = torch.fft.fftfreq(Nx, device=tensor.device)
+        g_kz, g_ky, g_kx = torch.meshgrid(kz, ky, kx, indexing="ij")
+
+        kr2 = g_kx**2 + g_ky**2
+        W = 1.0 - (2.0 / torch.pi) * torch.atan((beta * g_kz.abs() / (kr2.sqrt() + 1e-3)) ** 2)
+        Wa = W * torch.exp(-alpha * kr2)
+
+        def _apply(x: torch.Tensor) -> torch.Tensor:
+            f = torch.fft.fftn(x, dim=(-3, -2, -1))
+            return torch.fft.ifftn(f * Wa, dim=(-3, -2, -1)).real
+
+        if tensor.is_complex():
+            return torch.complex(_apply(tensor.real), _apply(tensor.imag))
+        return _apply(tensor)
+
+    def kr_filter(self, tensor: torch.Tensor, radius: float, width: float = 0.05) -> torch.Tensor:
+        """2-D lateral Fourier band-limit with a sigmoid aperture.
+
+        A smoother-rolloff alternative to the Butterworth ``q_lowpass``.
+        Ported from ptyrad's ``kr_filter``. Unlike ``q_lowpass`` (physical
+        inverse-Angstrom cutoff, uses ``self.sampling``), ``radius`` here is
+        unitless (a fraction of Nyquist), matching ptyrad/fold_slice
+        convention.
+
+        Parameters
+        ----------
+        tensor : torch.Tensor
+            Real or complex, shape ``(..., H, W)``. Complex inputs are
+            filtered as independent real/imag channels.
+        radius : float
+            Sigmoid center as a fraction of Nyquist, in ``(0, 1]``.
+        width : float
+            Sigmoid transition width; smaller values give a harder edge.
+        """
+        Ny, Nx = tensor.shape[-2:]
+        ry = torch.linspace(-0.5, 0.5, Ny, device=tensor.device)
+        rx = torch.linspace(-0.5, 0.5, Nx, device=tensor.device)
+        g_ry, g_rx = torch.meshgrid(ry, rx, indexing="ij")
+        rr = (g_ry**2 + g_rx**2).sqrt()
+        mask_centered = torch.sigmoid((radius - rr) / width)
+        W = torch.fft.ifftshift(mask_centered)
+
+        def _apply(x: torch.Tensor) -> torch.Tensor:
+            f = torch.fft.fft2(x)
+            return torch.fft.ifft2(f * W).real
+
+        if tensor.is_complex():
+            return torch.complex(_apply(tensor.real), _apply(tensor.imag))
+        return _apply(tensor)
+
+    def gaussian_blur_z(
+        self, tensor: torch.Tensor, sigma: float, kernel_size: int | None = None
+    ) -> torch.Tensor:
+        """Real-space 1-D Gaussian blur along the slice (z) axis.
+
+        Ptyrad's ``obj_zblur``. Avoids the Fourier wrap-around artifact that
+        ``kz_filter`` can introduce at the top/bottom slice; preferred for
+        twisted 2-D materials / vertical heterostructures.
+
+        Parameters
+        ----------
+        tensor : torch.Tensor
+            Real or complex, shape ``(slices, H, W)`` with ``slices > 1``.
+            Complex inputs are filtered as independent real/imag channels
+            (matching ``gaussian_blur_2d``). Edges use zero-padding.
+        sigma : float
+            Standard deviation of the Gaussian kernel, in z-pixels. The
+            kernel size is ``2 * ceil(3 * sigma) + 1`` (matches
+            ``gaussian_blur_2d``) unless overridden by ``kernel_size``.
+        kernel_size : int | None
+            Explicit kernel length; auto-computed from ``sigma`` when
+            ``None``.
+        """
+        if kernel_size is None:
+            kernel_size = int(2 * math.ceil(3 * sigma) + 1)
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        half = kernel_size // 2
+
+        z = torch.arange(-half, half + 1, dtype=torch.float32, device=tensor.device)
+        kernel = torch.exp(-0.5 * (z / sigma) ** 2)
+        kernel = kernel / kernel.sum()
+        k2d = kernel.view(1, 1, -1, 1)
+
+        Nz, Ny, Nx = tensor.shape[-3:]
+
+        def _apply(x: torch.Tensor) -> torch.Tensor:
+            flat = x.reshape(1, 1, Nz, Ny * Nx)
+            out = nn.functional.conv2d(flat, k2d, padding=(half, 0))
+            return out.reshape(Nz, Ny, Nx)
+
+        if tensor.is_complex():
+            return torch.complex(_apply(tensor.real), _apply(tensor.imag))
+        return _apply(tensor)
 
 
 class ObjectPixelated(ObjectConstraints):

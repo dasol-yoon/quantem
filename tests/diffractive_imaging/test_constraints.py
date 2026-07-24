@@ -238,6 +238,92 @@ class TestPurePhaseRealValued:
         assert not out.is_complex()
 
 
+# --- Depth / lateral regularizer filters (kz_filter, kr_filter, gaussian_blur_z) ---
+
+
+class TestDepthLateralFilters:
+    def _make_obj(self, obj_type, num_slices=6) -> ObjectPixelated:
+        obj = ObjectPixelated.from_uniform(
+            obj_type=obj_type, num_slices=num_slices, slice_thicknesses=2.0
+        )
+        obj._initialize_obj((num_slices, 16, 16), sampling=(0.1, 0.1))
+        return obj
+
+    def _random_tensor(self, obj_type, num_slices, rng):
+        if obj_type == "complex":
+            amp = 0.95 + 0.1 * torch.as_tensor(
+                rng.random((num_slices, 16, 16)), dtype=torch.float32
+            )
+            phase = 0.1 * torch.as_tensor(
+                rng.standard_normal((num_slices, 16, 16)), dtype=torch.float32
+            )
+            return amp * torch.exp(1j * phase)
+        return 0.1 * torch.as_tensor(rng.standard_normal((num_slices, 16, 16)), dtype=torch.float32)
+
+    @pytest.mark.parametrize("obj_type", ["potential", "pure_phase", "complex"])
+    @pytest.mark.parametrize(
+        "method,kwargs",
+        [
+            ("kz_filter", {"beta": 0.5, "alpha": 1.0}),
+            ("kr_filter", {"radius": 0.6, "width": 0.05}),
+            ("gaussian_blur_z", {"sigma": 1.0}),
+        ],
+    )
+    def test_filter_preserves_shape_and_dtype(self, obj_type, method, kwargs):
+        rng = np.random.default_rng(0)
+        obj = self._make_obj(obj_type)
+        raw = self._random_tensor(obj_type, 6, rng)
+        out = getattr(obj, method)(raw, **kwargs)
+        assert out.shape == raw.shape
+        assert out.is_complex() == raw.is_complex()
+
+    @pytest.mark.parametrize("method,kwargs", [
+        ("kz_filter", {"beta": 0.5, "alpha": 1.0}),
+        ("gaussian_blur_z", {"sigma": 1.0}),
+    ])
+    def test_depth_filters_smooth_the_slice_axis(self, method, kwargs):
+        # Oscillating z-profile, uniform laterally, on a real (potential) object.
+        obj = self._make_obj("potential", num_slices=8)
+        z = torch.arange(8, dtype=torch.float32)
+        profile = torch.sin(z * 2.0)
+        raw = profile[:, None, None].expand(8, 16, 16).clone()
+        out = getattr(obj, method)(raw, **kwargs)
+        assert out.var(dim=0).mean() < raw.var(dim=0).mean()
+
+    def test_gaussian_blur_z_leaves_lateral_dims_untouched(self):
+        obj = self._make_obj("potential", num_slices=8)
+        z = torch.arange(8, dtype=torch.float32)
+        profile = torch.sin(z * 2.0)
+        raw = profile[:, None, None].expand(8, 16, 16).clone()
+        out = obj.gaussian_blur_z(raw, sigma=1.0)
+        assert torch.allclose(out[0], out[0, 0, 0] * torch.ones(16, 16))
+
+    def test_kz_filter_and_z_blur_wired_as_alternatives(self):
+        # Exercise the apply_hard_constraints wiring end-to-end (num_slices > 1).
+        obj = self._make_obj("potential", num_slices=6)
+        obj.constraints.kz_filter_beta = 0.5
+        out = obj.apply_hard_constraints(obj._obj)
+        assert out.shape == obj._obj.shape
+        obj.constraints.kz_filter_beta = None
+        obj.constraints.z_blur_sigma = 1.0
+        out2 = obj.apply_hard_constraints(obj._obj)
+        assert out2.shape == obj._obj.shape
+
+    def test_kr_filter_via_constraints_does_not_require_multislice(self):
+        obj = self._make_obj("pure_phase", num_slices=1)
+        obj.constraints.kr_filter_radius = 0.6
+        out = obj.apply_hard_constraints(obj._obj)
+        assert out.shape == obj._obj.shape
+
+    def test_depth_filters_combine_with_existing_lateral_filters(self):
+        # kz_filter_beta + q_lowpass shouldn't crash when both active.
+        obj = self._make_obj("potential", num_slices=6)
+        obj.constraints.kz_filter_beta = 0.5
+        obj.constraints.q_lowpass = 0.3
+        out = obj.apply_hard_constraints(obj._obj)
+        assert out.shape == obj._obj.shape
+
+
 # --- FOV-mask single application ---------------------------------------------
 
 
