@@ -874,7 +874,7 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
 
         Transfer function::
 
-            W(k)  = 1 - (2/pi) * arctan((beta * |kz| / sqrt(kx^2 + ky^2))^2)
+            W(k)  = 1 - (2/pi) * arctan((beta * |kz| / sqrt(kx^2 + ky^2 + 1e-3))^2)
             Wa(k) = W(k) * exp(-alpha * (kx^2 + ky^2))
 
         Parameters
@@ -897,7 +897,15 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
         g_kz, g_ky, g_kx = torch.meshgrid(kz, ky, kx, indexing="ij")
 
         kr2 = g_kx**2 + g_ky**2
-        W = 1.0 - (2.0 / torch.pi) * torch.atan((beta * g_kz.abs() / (kr2.sqrt() + 1e-3)) ** 2)
+        # The 1e-3 regularizer goes INSIDE the sqrt, matching fold_slice's
+        # regulation_multilayers.m and ptyrad's kz_filter. Adding it outside instead
+        # lowers the effective kr floor from 0.0316 to 0.001, which drives W -> 0 along
+        # the whole kr = 0 line -- i.e. it annihilates the laterally-uniform component
+        # and forces every slice's lateral mean to the global mean, flattening the
+        # object's depth profile. See test_kz_filter_matches_ptyrad_transfer_function.
+        W = 1.0 - (2.0 / torch.pi) * torch.atan(
+            (beta * g_kz.abs() / torch.sqrt(kr2 + 1e-3)) ** 2
+        )
         Wa = W * torch.exp(-alpha * kr2)
 
         def _apply(x: torch.Tensor) -> torch.Tensor:

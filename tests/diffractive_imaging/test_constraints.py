@@ -323,6 +323,67 @@ class TestDepthLateralFilters:
         out = obj.apply_hard_constraints(obj._obj)
         assert out.shape == obj._obj.shape
 
+    def test_kz_filter_matches_ptyrad_transfer_function(self):
+        """kz_filter must reproduce fold_slice/ptyrad's arctan filter exactly.
+
+        The transfer function is recovered by filtering a delta at the origin: since
+        fftn(delta) == 1 everywhere, fftn(kz_filter(delta)) == Wa. Compared against an
+        independent scalar reference with the 1e-3 regularizer INSIDE the sqrt, as in
+        fold_slice's regulation_multilayers.m and ptyrad's constraints.kz_filter.
+        """
+        import math
+
+        beta, alpha, n = 0.5, 1.0, 8
+        obj = self._make_obj("potential", num_slices=n)
+        delta = torch.zeros(n, n, n)
+        delta[0, 0, 0] = 1.0
+        wa = torch.fft.fftn(obj.kz_filter(delta, beta=beta, alpha=alpha))
+        # Wa is real and even, so the filtered delta transforms back to a real spectrum.
+        assert wa.imag.abs().max() < 1e-6
+        wa = wa.real
+
+        def reference(kz, kr2):
+            arg = (beta * abs(kz) / math.sqrt(kr2 + 1e-3)) ** 2
+            return (1.0 - math.atan(arg) / (math.pi / 2)) * math.exp(-alpha * kr2)
+
+        freq = torch.fft.fftfreq(n).tolist()
+        for iz, iy, ix in [(0, 0, 0), (1, 0, 0), (2, 1, 0), (4, 0, 0), (0, 2, 2), (3, 1, 1)]:
+            kr2 = freq[ix] ** 2 + freq[iy] ** 2
+            assert wa[iz, iy, ix].item() == pytest.approx(reference(freq[iz], kr2), abs=1e-5)
+
+        # The kr = 0 line is the lateral mean of each slice, i.e. the object's depth
+        # profile. Regression guard: with the epsilon misplaced outside the sqrt this
+        # value collapses to 1.6e-4 and the depth profile is forced flat.
+        assert wa[1, 0, 0].item() == pytest.approx(0.159548, abs=1e-5)
+        assert wa[0, 0, 0].item() == pytest.approx(1.0, abs=1e-6)  # DC preserved
+
+
+# --- Constraint default isolation ---------------------------------------------
+
+
+class TestConstraintDefaultsIsolation:
+    def test_reset_recon_does_not_mutate_class_defaults(self, ptycho):
+        """``reset_recon`` must hand out a *copy* of ``DEFAULT_CONSTRAINTS``.
+
+        The constraints setter binds a ``Constraints`` instance by reference, so if
+        ``reset_recon`` assigned the class-level singleton directly, the next partial-dict
+        update would ``setattr`` onto that singleton and silently change the defaults for
+        every subsequent model in the process -- e.g. a parameter sweep's later "baseline"
+        runs would inherit an earlier run's constraints.
+        """
+        from quantem.diffractive_imaging.object_models import ObjectConstraints
+
+        pristine = PtychoObjConstraintParams.Raster()
+        assert ObjectConstraints.DEFAULT_CONSTRAINTS == pristine
+
+        ptycho.reset_recon()
+        ptycho.obj_model.constraints = {"gaussian_sigma": 3.0, "tv_weight_xy": 0.25}
+
+        assert ptycho.obj_model.constraints.gaussian_sigma == 3.0
+        assert ptycho.obj_model.constraints.tv_weight_xy == 0.25
+        assert ObjectConstraints.DEFAULT_CONSTRAINTS == pristine
+        assert ptycho.obj_model.constraints is not ObjectConstraints.DEFAULT_CONSTRAINTS
+
 
 # --- FOV-mask single application ---------------------------------------------
 
